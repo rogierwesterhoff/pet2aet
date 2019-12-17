@@ -1,0 +1,339 @@
+//++++ FUNCTIONS ++++
+
+//Function to import Sentinel-2, and scaling all bands correctly
+function s2ScaleAndBareEssentials(img) {
+  var s2 = img.select(['B2','B3','B4','B8'])
+                       .divide(10000)
+                       .addBands(img.select(['QA60','SCL','MSK_CLDPRB']))
+                       .addBands(img.select(['TCI_R','TCI_G','TCI_B']))
+                       .addBands(img.metadata('system:time_start'));
+  return s2;
+}
+
+// Function to mask clouds using the addtional Sentinel-2 QA60 (option 1) or
+// SCL and MSK_CLDPRB bands (option2).
+var maskClouds = function(image){
+ /*
+ // option 1: for level 1 data
+ var qa = image.select('QA60');
+  // Bits 10 and 11 are clouds and cirrus, respectively.
+  var cloudBitMask = Math.pow(2, 10);
+  var cirrusBitMask = Math.pow(2, 11);
+  
+  // clear if both flags set to zero.
+  //var clear = qa.bitwiseAnd(cloudBitMask).eq(0);
+  var clear = qa.bitwiseAnd(cloudBitMask).eq(0).and(
+           qa.bitwiseAnd(cirrusBitMask).eq(0));
+  
+  var mask = clear.eq(1); 
+ */
+ 
+ // I am using option 2:
+var cloudProb = image.select('MSK_CLDPRB');
+var scl = image.select('SCL'); 
+
+var shadow = scl.eq(3); // 3 = cloud shadow
+var cirrus = scl.eq(10); // 10 = cirrus
+var mask = cloudProb.lt(2).and((cirrus).neq(1)).and((shadow).neq(1)); // thanks Eric Waller for the correction
+
+return image.updateMask(mask);
+
+};
+
+// This function adds vegetation and water index bands to images.
+var addIndexBands = function(image) {
+  return image
+    .addBands(image.normalizedDifference(['B8', 'B4']).rename('NDVI'))
+        .addBands(image.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+      'NIR': image.select('B8'),
+      'RED': image.select('B4'),
+      'BLUE': image.select('B2')
+    }).rename('EVI'));
+};
+
+var laiFromNDVI = function(image){
+// TODO add better expression (simpler) 
+var laitmp = image.expression(
+    '- 517.06 * x**5 + 1053.6 * x**4 - 738.39 * x**3 + 219.91 * x**2 - 24.145*x + 0.9378', {
+      'x': image.select('NDVI')
+    });
+var replacement = ee.Image(1e-6);
+var ndvi = image.select('NDVI');
+var replaced = laitmp.where(ndvi.lte(0.075),replacement);
+var replacement2 = ee.Image(6.606);
+var laiout = replaced.where(ndvi.gte(0.825),replacement2);
+return laiout;
+};
+
+var fparFromNDVI = function(image){
+var fpartmp = image.expression(
+    '-16.323 * x**4 + 29.716 * x**3 - 17.695 * x**2 + 4.9383 * x - 0.2521', {
+      'x': image.select('NDVI')
+    });
+var replacement = ee.Image(1e-6);
+var ndvi = image.select('NDVI');
+var replaced = fpartmp.where(ndvi.lte(0.075),replacement);
+var replacement2 = ee.Image(0.9);
+var fparout = replaced.where(ndvi.gte(0.825),replacement2);
+return fparout;
+};
+
+var relativeTranspirationFromLAI = function(image){
+var surfaceResistanceUnstressedGrass = image.expression(
+  '363.33 / x',{
+  'x': image.select('LAI')
+  });// assuming unstressed grass: rs=55; max LAI = 6.606 means RT = 1: c = 363.33 in rs = c/lai;
+  var relativeTranspiration = image.expression(
+      '4.157 * x**(-0.1417) - 1.308', { // calc_AETPET_from_LAI_rs.m
+        'x': surfaceResistanceUnstressedGrass
+      });
+return relativeTranspiration;
+};
+
+var relativeTranspirationFromLAI2 = function(image){
+var surfaceResistanceUnstressedForest = image.expression(
+  '759.69 / x',{
+  'x': image.select('LAI')
+  });// assuming unstressed grass: rs=115; max LAI = 6.606 means RT = 1: c = 363.33 in rs = c/lai;
+  var relativeTranspiration = image.expression(
+      '47.39 * x**(-0.8023) - 0.04752', { // calc_AETPET_from_LAI_rs.m
+        'x': surfaceResistanceUnstressedForest
+      });
+return relativeTranspiration;
+};
+
+var soilHeatFLuxFractionFromNDVI = function(image){
+
+var GSoilFraction = image.expression( // eq. 11 Mu et al (2011)
+  '-0.27 * x + 0.39',{
+  'x': image.select('NDVI')
+  });
+return GSoilFraction;
+};
+// ++++ END OF FUNCTIONS ++++
+
+// +++ COLOR PALETTES +++ // see https://github.com/gee-community/ee-palettes
+var palettes = require('users/gena/packages:palettes');
+var colorPalette = palettes.kovesi.rainbow_bgyrm_35_85_c69[7].reverse();
+var vizEt = {min: 100, max: 1200, palette: colorPalette}; // et
+
+// +++ END OF COLOR PALETTES +++
+  
+// +++ Import LCDB data as FeatureCollections. See link for descriptions:
+// https://drive.google.com/file/d/1AyZaihA0I9GfZT32m1X2dMwrzwXZQuA_/view?usp=sharing
+var lcdbTable = ee.FeatureCollection("users/rogierwesterhoff/LCDB-v41-NZ/WGS84_lcdb-v41-land-cover-database-version-41-mainland-new-zealand");
+// +++ End import LCDB
+
+// +++ import PET data 
+// var pet = ee.Image('users/rogierwesterhoff/pet_vcsn');
+var pet = ee.Image('users/rogierwesterhoff/pet_mod16_Westerhoff').rename('pet');
+var sigmaPet = ee.Image('users/rogierwesterhoff/sigmapet_mod16_Westerhoff');
+var mask2 = pet.gte(0);
+// +++ end import PET data
+
+// +++ import JRC water mask. 
+// For example water mask script: https://code.earthengine.google.com/eb6bdc9a0ce64008f63e06d940a779ac
+var gsw = ee.Image('JRC/GSW1_1/GlobalSurfaceWater');
+var occurrence = gsw.select('occurrence');
+var waterMask = occurrence.gt(90).unmask(0);
+// +++ end import JRC water mask
+
+var roi = pet.geometry();
+
+print('pet (mm/day): ',pet);
+
+Map.centerObject(roi,8);
+Map.addLayer(pet.multiply(365),
+    {min: 100, max: 1200, palette: colorPalette},
+        'Mean PET (mm/year)',false);
+        
+// +++ SENTINEL-2 IMPORT +++
+// I am using atmospherically corrected Sentinel-2 (_SR),
+// that is only available as from half Dec 2018, hence the start date
+var startDate = '2018-12-14'; // start date of satellite data acquisition
+var endDate = '2019-12-11'; // end date of satellite data acquisition
+
+// Load Sentinel-2 surface reflectance data (Level 2A).
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR')
+  .filterDate(startDate,endDate)
+  .filterBounds(roi)
+  .sort('MSK_CLDPRB') //// Sort by scene cloudiness, ascending.
+  .limit(4999)
+  .map(s2ScaleAndBareEssentials);
+// s2 = s2.map(s2ScaleAndBareEssentials);
+print('s2 ', s2);
+
+var cloudFreeMosaic = s2
+  .map(maskClouds)
+  .median()
+  .updateMask(mask2);
+
+Map.addLayer(cloudFreeMosaic, {bands: ['TCI_R', 'TCI_G', 'TCI_B'], min: 0, max: 255},
+            'Sentinel-2 TCI RGB',false);
+
+var ndvi = s2
+  .map(maskClouds)
+  .map(addIndexBands)
+  .select('NDVI')
+  .median()
+  .updateMask(mask2);
+
+Map.addLayer(ndvi,
+  {min: -1, max: 1, palette: ['blue', 'white', 'green']},
+  'Sentinel-2 NDVI',false);
+
+// +++ END SENTINEL-2 IMPORT +++
+
+// Calculate LAI and FPAR
+var lai = laiFromNDVI(ndvi).rename('LAI');
+
+Map.addLayer(lai,
+        {min: 0, max: 7, palette: ['3b0200', '977705', 'ca9f06', 'ffca09', '006a03', '003b02']},
+        'LAI',false);  
+
+var fpar = fparFromNDVI(ndvi).rename('FPAR');
+
+Map.addLayer(fpar,
+        {min: 0, max: 1, palette: ['e1e4b4', '999d60', '2ec409', '0a4b06']},
+        'FPAR',false);  
+
+// Calculate soil heat flux ratio
+var soilHeatFluxFraction = soilHeatFLuxFractionFromNDVI(ndvi)
+  .multiply(ee.Image(1).subtract(fpar));
+  
+Map.addLayer(soilHeatFluxFraction,
+        {min: 0, max: 1, palette: ['e1e4b4', '999d60', '2ec409', '0a4b06']},
+        'Gsoil',false);  
+        
+// CALCULATE RELATIVE TRANSPIRATION
+var rt = relativeTranspirationFromLAI(lai)
+  .multiply(fpar)
+  .add(soilHeatFluxFraction)
+  .rename('relTransp'); //print('rt: ',rt)
+
+var replaceRT = ee.Image(1);
+var rt = rt.where(waterMask.eq(1),replaceRT);
+
+Map.addLayer(rt,
+        {min: 0, max: 1, palette: ['red', 'yellow', 'green']},
+        'RelTransp',false);  
+
+// CALCULATE AET
+var aet = pet.multiply(rt).rename('aet');
+Map.addLayer(aet.multiply(365),
+        {min: 100, max: 1200, palette: colorPalette},
+        'AET (mm/yr)',true);  
+
+// histogram. 
+// Options for charts: https://developers.google.com/chart/interactive/docs/gallery/histogram
+var image = pet.addBands(aet).multiply(365);
+// Pre-define some customization options.
+var options = {
+//  title: 'AET and PET',
+  legend: {position: 'top', maxLines: 2},
+  colors: ['green', 'red'],
+  fontSize: 20,
+  hAxis: {title: 'ET (mm/yr)',
+          ticks: [100,200,300,400,500,600,700,800,900,1000,1100,1200]},
+  vAxis: {title: 'count'},
+  series: {
+    0: {color: 'green'},
+    1: {color: 'red'}}
+};
+
+// Make the histogram, set the options.
+var histogram = ui.Chart.image.histogram(image,roi,1000)
+    .setSeriesNames(['pet', 'aet'])
+    .setOptions(options);
+
+// Display the histogram.
+print(histogram);
+
+// CREATE A LEGEND
+// create vizualization parameters
+var viz = vizEt;
+ 
+// set position of panel
+var legend = ui.Panel({
+style: {
+position: 'bottom-left',
+padding: '8px 15px'
+}
+});
+ 
+// Create legend title
+var legendTitle = ui.Label({
+value: 'ET',
+style: {
+fontWeight: 'bold',
+fontSize: '18px',
+margin: '0 0 4px 0',
+padding: '0'
+}
+});
+ 
+// Add the title to the panel
+legend.add(legendTitle);
+ 
+// create the legend image
+var lon = ee.Image.pixelLonLat().select('latitude');
+var gradient = lon.multiply((viz.max-viz.min)/100.0).add(viz.min);
+var legendImage = gradient.visualize(viz);
+ 
+// create text on top of legend
+var panel = ui.Panel({
+widgets: [
+ui.Label(viz['max'])
+],
+});
+ 
+legend.add(panel);
+ 
+// create thumbnail from the image
+var thumbnail = ui.Thumbnail({
+image: legendImage,
+params: {bbox:'0,0,10,100', dimensions:'10x200'},
+style: {padding: '1px', position: 'bottom-center'}
+});
+ 
+// add the thumbnail to the legend
+legend.add(thumbnail);
+ 
+// create text on top of legend
+var panel = ui.Panel({
+widgets: [
+ui.Label(viz['min'])
+],
+});
+ 
+legend.add(panel);
+ 
+Map.add(legend);
+
+
+/*// export as Geotiff and Asset. See https://developers.google.com/earth-engine/exporting
+Export.image.toDrive({
+  image: aet.multiply(365).toInt(),//toFloat(),
+  description: 'meanActualEvapotranspirationInt',
+  crs: 'EPSG:4326',
+  fileFormat: 'GeoTIFF',
+  scale: 10,
+  region: roi,
+  maxPixels: 25e9
+});
+
+
+Export.image.toAsset({
+  image: pet.addBands(aet).multiply(365).toShort(),
+  description: 'meanEvapotranspirationShort',
+  assetId: 'etNzWesterhoff20002015Short',
+  scale: 10,
+  region: roi,
+  maxPixels: 25e9,
+  pyramidingPolicy: {
+    'pet': 'mean',
+    'aet': 'mean'
+  }
+});
+*/
